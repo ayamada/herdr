@@ -321,6 +321,34 @@ impl ClientShellState {
         outcome.repaint = true;
     }
 
+    /// Jumps to the tab the configured `switch_tab` bindings name for this key,
+    /// sending the same `Method::TabFocus` request as `switch_tab` and closing
+    /// the navigator. Unset bindings leave these keys inactive.
+    fn jump_to_navigator_tab(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(crate::input::KeybindAction::SwitchTab(index)) =
+            crate::input::resolve_indexed_action(
+                &self.config.keybinds.keybinds,
+                key,
+                crate::input::KeybindDispatch::Prefix,
+            )
+        else {
+            return false;
+        };
+        let binding =
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::SwitchTab(index));
+        if !self.indexed_navigation_target_exists(&binding) {
+            return false;
+        }
+        self.overlay = None;
+        self.record_binding(binding, outcome);
+        outcome.repaint = true;
+        true
+    }
+
     pub(super) fn workspace_action_id(&self) -> Option<String> {
         self.navigate_workspace_id
             .as_ref()
@@ -683,6 +711,9 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                return;
+            }
+            if self.jump_to_navigator_tab(key, outcome) {
                 return;
             }
             if matches!(code, KeyCode::Left | KeyCode::Right) && modifiers.is_empty() {
