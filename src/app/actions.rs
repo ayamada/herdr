@@ -2977,6 +2977,26 @@ mod tests {
     }
 
     #[test]
+    fn pane_died_last_pane_in_active_tab_focuses_right_tab() {
+        let mut state = app_with_workspaces(&["test"]);
+        let closing_tab = state.workspaces[0].test_add_tab(None);
+        let right_tab = state.workspaces[0].test_add_tab(None);
+        let right_root = state.workspaces[0].tabs[right_tab].root_pane;
+        let closing_root = state.workspaces[0].tabs[closing_tab].root_pane;
+        state.workspaces[0].switch_tab(closing_tab);
+        state.ensure_test_terminals();
+
+        state.handle_pane_died(closing_root);
+
+        assert_eq!(
+            state.workspaces[0].tabs[state.workspaces[0].active_tab].root_pane,
+            right_root
+        );
+        assert_eq!(state.workspaces[0].tabs.len(), 2);
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
     fn pane_died_multi_pane_keeps_workspace() {
         let mut state = app_with_workspaces(&["test"]);
         let second_id = state.workspaces[0].test_split(Direction::Horizontal);
