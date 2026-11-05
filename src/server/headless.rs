@@ -39,6 +39,7 @@ use crate::api;
 use crate::app;
 use crate::config;
 use crate::events::AppEvent;
+use crate::ghostty::ProgressReport;
 use crate::ipc::{
     bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
     SocketFileIdentity,
@@ -80,9 +81,12 @@ mod endpoint_requests;
 mod lifecycle;
 mod native_graphics;
 mod notifications;
+mod outer_progress;
 mod render;
 mod retained_surface;
 mod surface_interest;
+
+use self::outer_progress::OuterProgress;
 
 // Producers can refill even a bounded channel while it is being drained.
 // Yield to scheduled work and rendering between batches; select! below
@@ -219,6 +223,12 @@ pub struct HeadlessServer {
     /// when the title itself has not changed, without every code path that
     /// changes the foreground client having to remember to invalidate this.
     sent_window_title: Option<(u64, Option<String>)>,
+    /// Latest OSC 9;4 aggregate queued to the foreground client, paired with
+    /// the client that received it.
+    sent_outer_progress: Option<(u64, ProgressReport)>,
+    /// OSC 9;4 reports from every pane, aggregated into the one value the outer
+    /// terminal can display.
+    outer_progress: OuterProgress,
     /// Window title set through `client.window_title.set`. While present it wins
     /// over the configured `ui.window_title` until the API clears it again.
     api_window_title: Option<String>,
@@ -375,6 +385,8 @@ impl HeadlessServer {
                     .as_nanos()
             ),
             sent_window_title: None,
+            sent_outer_progress: None,
+            outer_progress: OuterProgress::default(),
             api_window_title: None,
             server_keybindings,
             server_config_diagnostic,
@@ -906,6 +918,7 @@ impl HeadlessServer {
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
+        self.sync_outer_progress();
         changed
     }
 
@@ -914,6 +927,7 @@ impl HeadlessServer {
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
+        self.sync_outer_progress();
         changed
     }
 
@@ -1518,6 +1532,63 @@ impl HeadlessServer {
         sent
     }
 
+    /// Pushes the aggregated pane progress to the foreground client when it
+    /// changed. Every pane reports into one indicator, so the value is the most
+    /// recently updated running pane and `Remove` when nothing is running.
+    fn sync_outer_progress(&mut self) {
+        self.prune_outer_progress();
+        let report = self
+            .outer_progress
+            .aggregate()
+            .unwrap_or(ProgressReport::REMOVE);
+        self.send_outer_progress(report);
+    }
+
+    /// Sends a progress report and remembers it only when a foreground client
+    /// with a live writer took it, so the next client to attach is written to.
+    fn send_outer_progress(&mut self, report: ProgressReport) -> bool {
+        let Some(client_id) = self.foreground_client_id else {
+            self.sent_outer_progress = None;
+            return false;
+        };
+        // A detached client keeps its entry with no writer, and a targeted send
+        // to one reports success without queuing anything.
+        if self
+            .clients
+            .get(&client_id)
+            .is_none_or(|client| client.writer.is_none())
+        {
+            self.sent_outer_progress = None;
+            return false;
+        }
+        if self.sent_outer_progress == Some((client_id, report)) {
+            return false;
+        }
+        let data = crate::protocol::endpoint::EndpointOuterProgress::from(report);
+        let sent = self.send_to_client(
+            client_id,
+            ServerMessage::EndpointControl {
+                kind: crate::protocol::endpoint::OUTER_PROGRESS_KIND.into(),
+                data: serde_json::to_string(&data).expect("outer progress is serializable"),
+            },
+        );
+        self.sent_outer_progress = sent.then_some((client_id, report));
+        sent
+    }
+
+    /// Drops reports for panes that no longer exist, so a closed pane cannot
+    /// leave the indicator stuck when no death event arrived.
+    fn prune_outer_progress(&mut self) {
+        let stale: Vec<_> = self
+            .outer_progress
+            .panes()
+            .filter(|pane_id| self.app.find_pane(*pane_id).is_none())
+            .collect();
+        for pane_id in stale {
+            self.outer_progress.forget_pane(pane_id);
+        }
+    }
+
     fn handle_client_window_title_api(&mut self, id: String, title: Option<String>) -> String {
         use api::schema::{ClientWindowTitleReason, ResponseResult};
 
@@ -1731,6 +1802,7 @@ impl HeadlessServer {
         }
         self.foreground_client_id = None;
         self.sync_foreground_client_state();
+        self.sync_outer_progress();
         self.resize_shared_runtime_to_effective_size();
     }
 
@@ -2027,6 +2099,7 @@ impl HeadlessServer {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
                 self.sync_foreground_client_state();
+                self.sync_outer_progress();
                 self.claim_unowned_shell_tab_geometry(client_id, true);
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
@@ -2346,9 +2419,11 @@ impl HeadlessServer {
                 client.host_sgr_pixels_active = None;
                 client.host_keyboard_report_all_active = None;
                 self.sent_window_title = None;
+                self.sent_outer_progress = None;
                 self.stream_host_mouse_capture_mode();
                 self.stream_direct_terminal_keyboard_mode();
                 self.sync_window_title();
+                self.sync_outer_progress();
                 self.send_to_client(
                     client_id,
                     ServerMessage::EndpointControl {

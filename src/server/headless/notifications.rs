@@ -302,6 +302,10 @@ impl HeadlessServer {
         if self.host_shutdown_requested() {
             return false;
         }
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            self.outer_progress.forget_pane(*pane_id);
+            self.sync_outer_progress();
+        }
         let focus_response = match &mut ev {
             AppEvent::WorktreeAddFinished(result) => result
                 .api_request
@@ -336,6 +340,13 @@ impl HeadlessServer {
                 // the foreground client instead of broadcasting to every attached client.
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
                 self.send_to_foreground_client(ServerMessage::Clipboard { data });
+                false
+            }
+            AppEvent::TerminalProgress { pane_id, report } => {
+                // Every pane feeds the single outer indicator, so a background agent
+                // stays visible. Aggregate first, then push the visible value.
+                self.outer_progress.observe(*pane_id, *report);
+                self.sync_outer_progress();
                 false
             }
             AppEvent::StateChanged { pane_id, agent, .. } => {

@@ -31,12 +31,39 @@ pub const AGENT_VIEW_PROJECTION_CAPABILITY: &str = "agent_view_projection";
 pub const AGENT_VIEW_PROJECTION_KIND: &str = "endpoint.agent-view.v1";
 pub const AGENT_COMPLETIONS_CAPABILITY: &str = "agent_completions";
 pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
+pub const OUTER_PROGRESS_KIND: &str = "endpoint.outer-progress.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointAgentCompletions {
     pub boot_id: String,
     pub revision: u64,
     pub completions: std::collections::BTreeMap<String, u64>,
+}
+
+/// Aggregated pane progress for the outer terminal's single indicator.
+///
+/// The state stays numeric so the client can write it through as the OSC 9;4
+/// state without an enum mapping. An unknown kind is ignored by older clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointOuterProgress {
+    pub state: u8,
+    #[serde(default)]
+    pub progress: Option<u8>,
+}
+
+impl EndpointOuterProgress {
+    pub fn validate(self) -> Option<Self> {
+        (self.state <= 4 && self.progress.is_none_or(|progress| progress <= 100)).then_some(self)
+    }
+}
+
+impl From<crate::ghostty::ProgressReport> for EndpointOuterProgress {
+    fn from(report: crate::ghostty::ProgressReport) -> Self {
+        Self {
+            state: report.state.osc_state(),
+            progress: report.progress,
+        }
+    }
 }
 
 fn default_true() -> bool {

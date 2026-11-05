@@ -118,6 +118,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         popup_owner_tab_id: None,
         client_shell_boot_id: "test-boot".into(),
         sent_window_title: None,
+        sent_outer_progress: None,
+        outer_progress: Default::default(),
         api_window_title: None,
         server_keybindings,
         server_config_diagnostic: None,
@@ -7175,6 +7177,177 @@ fn terminal_bell_targets_foreground_client_only() {
             .recv_timeout(Duration::from_millis(50))
             .is_err(),
         "bells without a foreground client must not be retained"
+    );
+}
+
+fn read_outer_progress(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> crate::protocol::endpoint::EndpointOuterProgress {
+    let message = read_server_message(
+        rx.recv_timeout(Duration::from_millis(100))
+            .expect("outer progress"),
+    );
+    let ServerMessage::EndpointControl { kind, data } = message else {
+        panic!("expected endpoint control, got {message:?}");
+    };
+    assert_eq!(kind, crate::protocol::endpoint::OUTER_PROGRESS_KIND);
+    serde_json::from_str(&data).expect("decode outer progress")
+}
+
+fn outer_progress(
+    state: u8,
+    progress: Option<u8>,
+) -> crate::protocol::endpoint::EndpointOuterProgress {
+    crate::protocol::endpoint::EndpointOuterProgress { state, progress }
+}
+
+fn progress_test_server() -> (
+    HeadlessServer,
+    crate::layout::PaneId,
+    crate::layout::PaneId,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("progress");
+    let first = workspace.tabs[0].root_pane;
+    let second = workspace.test_split(ratatui::layout::Direction::Vertical);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+
+    let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+    server.clients.insert(
+        2,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_tx),
+        ),
+    );
+    server.foreground_client_id = Some(2);
+    (server, first, second, foreground_control_rx)
+}
+
+fn progress_report(
+    state: crate::ghostty::ProgressState,
+    progress: Option<u8>,
+) -> crate::ghostty::ProgressReport {
+    crate::ghostty::ProgressReport { state, progress }
+}
+
+#[test]
+fn terminal_progress_aggregates_every_pane_and_clears_when_idle() {
+    use crate::ghostty::ProgressState;
+
+    let (mut server, first, second, control_rx) = progress_test_server();
+
+    // A pane that does not hold focus still reaches the outer terminal.
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: first,
+        report: progress_report(ProgressState::Set, Some(42)),
+    });
+    assert_eq!(
+        read_outer_progress(&control_rx),
+        outer_progress(1, Some(42))
+    );
+
+    // Concurrent panes alternate; the newest report is the visible one.
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: second,
+        report: progress_report(ProgressState::Indeterminate, None),
+    });
+    assert_eq!(read_outer_progress(&control_rx), outer_progress(3, None));
+
+    // Finishing one pane must not clear the pane that is still running.
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: second,
+        report: crate::ghostty::ProgressReport::REMOVE,
+    });
+    assert_eq!(
+        read_outer_progress(&control_rx),
+        outer_progress(1, Some(42))
+    );
+
+    // An unchanged value is not sent twice.
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: first,
+        report: progress_report(ProgressState::Set, Some(42)),
+    });
+    assert!(control_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+    // Only the last removal clears the indicator.
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: first,
+        report: crate::ghostty::ProgressReport::REMOVE,
+    });
+    assert_eq!(read_outer_progress(&control_rx), outer_progress(0, None));
+}
+
+#[test]
+fn terminal_progress_forgets_a_pane_that_never_reported_death() {
+    use crate::ghostty::ProgressState;
+
+    let (mut server, first, _second, control_rx) = progress_test_server();
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: first,
+        report: progress_report(ProgressState::Set, Some(10)),
+    });
+    assert_eq!(
+        read_outer_progress(&control_rx),
+        outer_progress(1, Some(10))
+    );
+
+    // A pane close that produced no death event is pruned on the next sync.
+    server.app.state.workspaces.clear();
+    server.sync_outer_progress();
+    assert_eq!(read_outer_progress(&control_rx), outer_progress(0, None));
+}
+
+#[test]
+fn terminal_progress_resyncs_a_promoted_foreground_client() {
+    use crate::ghostty::ProgressState;
+
+    let (mut server, first, _second, first_control_rx) = progress_test_server();
+    server.handle_internal_event_with_forwarding(AppEvent::TerminalProgress {
+        pane_id: first,
+        report: progress_report(ProgressState::Set, Some(42)),
+    });
+    assert_eq!(
+        read_outer_progress(&first_control_rx),
+        outer_progress(1, Some(42))
+    );
+
+    let (second_tx, second_control_rx, _second_render_rx) = test_client_writer();
+    server.clients.insert(
+        3,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            3,
+            RenderEncoding::SemanticFrame,
+            Some(second_tx),
+        ),
+    );
+
+    // Promotion keeps the current aggregate visible on the new outer terminal.
+    server.foreground_client_id = Some(3);
+    server.sync_outer_progress();
+    assert_eq!(
+        read_outer_progress(&second_control_rx),
+        outer_progress(1, Some(42))
+    );
+
+    // Detaching the foreground client drops the send cache so a later client
+    // is written to even when the value has not changed.
+    server.foreground_client_id = None;
+    server.sync_outer_progress();
+    server.foreground_client_id = Some(3);
+    server.sync_outer_progress();
+    assert_eq!(
+        read_outer_progress(&second_control_rx),
+        outer_progress(1, Some(42))
     );
 }
 
