@@ -1029,7 +1029,7 @@ fn render_navigator_overlay(
         if n.search_focused {
             " search type · move ↑↓/ctrl+n/p · open enter · back esc"
         } else {
-            " ↑↓/j/k rows · ←→ workspace · / search · a/b/w/i/d filter · enter open · esc close"
+            " ↑↓/j/k rows · ←→ workspace · 1-9 tab · / search · a/b/w/i/d filter · enter open · esc close"
         },
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
