@@ -39,7 +39,7 @@ use crate::api;
 use crate::app;
 use crate::config;
 use crate::events::AppEvent;
-use crate::ghostty::ProgressReport;
+use crate::ghostty::{ProgressReport, ProgressState};
 use crate::ipc::{
     bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
     SocketFileIdentity,
@@ -1532,24 +1532,16 @@ impl HeadlessServer {
         sent
     }
 
-    /// Pushes the aggregated pane progress to the foreground client when it
-    /// changed. Every pane reports into one indicator, so the value is the most
-    /// recently updated running pane and `Remove` when nothing is running.
+    /// Pushes the aggregated pane progress to the foreground client when the
+    /// visible value changed. Nothing is sent while no pane is running, so an
+    /// attach with no activity stays free of extra controls.
     fn sync_outer_progress(&mut self) {
         self.prune_outer_progress();
-        let report = self
-            .outer_progress
-            .aggregate()
-            .unwrap_or(ProgressReport::REMOVE);
-        self.send_outer_progress(report);
-    }
+        let value = self.outer_progress.aggregate();
 
-    /// Sends a progress report and remembers it only when a foreground client
-    /// with a live writer took it, so the next client to attach is written to.
-    fn send_outer_progress(&mut self, report: ProgressReport) -> bool {
         let Some(client_id) = self.foreground_client_id else {
             self.sent_outer_progress = None;
-            return false;
+            return;
         };
         // A detached client keeps its entry with no writer, and a targeted send
         // to one reports success without queuing anything.
@@ -1559,11 +1551,33 @@ impl HeadlessServer {
             .is_none_or(|client| client.writer.is_none())
         {
             self.sent_outer_progress = None;
-            return false;
+            return;
         }
-        if self.sent_outer_progress == Some((client_id, report)) {
-            return false;
+
+        // The cache describes what this client is displaying. A client change
+        // means the new outer terminal shows nothing yet.
+        let displayed = self
+            .sent_outer_progress
+            .filter(|(sent_client, _)| *sent_client == client_id)
+            .map(|(_, report)| report);
+
+        match value {
+            Some(report) if displayed == Some(report) => {}
+            Some(report) => {
+                self.send_outer_progress(client_id, report);
+            }
+            None => {
+                // Clear only a value this client is actually showing.
+                if displayed.is_some_and(|report| report.state != ProgressState::Remove) {
+                    self.send_outer_progress(client_id, ProgressReport::REMOVE);
+                }
+            }
         }
+    }
+
+    /// Sends a progress report and remembers it only when the foreground client
+    /// took it, so the next client to attach is written to.
+    fn send_outer_progress(&mut self, client_id: u64, report: ProgressReport) -> bool {
         let data = crate::protocol::endpoint::EndpointOuterProgress::from(report);
         let sent = self.send_to_client(
             client_id,
