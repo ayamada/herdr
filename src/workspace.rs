@@ -223,12 +223,16 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Updates `active_tab` after the tab at `removed_idx` was removed.
+    ///
+    /// Closing the active tab focuses its right neighbor (the tab that slides
+    /// into `removed_idx`), falling back to the left neighbor at the right edge.
     fn adjust_active_tab_after_removal(&mut self, removed_idx: usize) {
         if self.tabs.is_empty() {
             self.active_tab = 0;
         } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
-        } else if removed_idx <= self.active_tab && self.active_tab > 0 {
+        } else if removed_idx < self.active_tab {
             self.active_tab -= 1;
         }
     }
@@ -580,11 +584,7 @@ impl Workspace {
         for pane_id in tab.panes.keys() {
             self.unregister_pane(*pane_id);
         }
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if idx <= self.active_tab && self.active_tab > 0 {
-            self.active_tab -= 1;
-        }
+        self.adjust_active_tab_after_removal(idx);
         true
     }
 
@@ -878,11 +878,7 @@ impl Workspace {
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            } else if tab_idx <= self.active_tab && self.active_tab > 0 {
-                self.active_tab -= 1;
-            }
+            self.adjust_active_tab_after_removal(tab_idx);
             return false;
         }
 
@@ -1121,11 +1117,7 @@ impl Workspace {
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            } else if tab_idx <= self.active_tab && self.active_tab > 0 {
-                self.active_tab -= 1;
-            }
+            self.adjust_active_tab_after_removal(tab_idx);
             return false;
         }
 
@@ -1512,6 +1504,52 @@ mod tests {
         let fourth_tab = ws.test_add_tab(None);
         let fourth_root = ws.tabs[fourth_tab].root_pane;
         assert_eq!(ws.public_tab_number_for_pane(fourth_root), Some(4));
+        ws.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn closing_active_tab_focuses_right_neighbor() {
+        let mut ws = Workspace::test_new("test");
+        let first_root = ws.tabs[0].root_pane;
+        let closing_tab = ws.test_add_tab(None);
+        let closing_root = ws.tabs[closing_tab].root_pane;
+        let right_tab = ws.test_add_tab(None);
+        let right_root = ws.tabs[right_tab].root_pane;
+        ws.switch_tab(closing_tab);
+
+        assert!(ws.close_tab(closing_tab));
+
+        assert_eq!(ws.tabs[ws.active_tab].root_pane, right_root);
+        assert_eq!(ws.public_tab_number_for_pane(first_root), Some(1));
+        assert_eq!(ws.public_tab_number_for_pane(closing_root), None);
+        ws.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn closing_rightmost_active_tab_focuses_left_neighbor() {
+        let mut ws = Workspace::test_new("test");
+        let left_root = ws.tabs[0].root_pane;
+        let closing_tab = ws.test_add_tab(None);
+        ws.switch_tab(closing_tab);
+
+        assert!(ws.close_tab(closing_tab));
+
+        assert_eq!(ws.tabs[ws.active_tab].root_pane, left_root);
+        ws.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn shell_exit_last_pane_in_active_tab_focuses_right_neighbor() {
+        let mut ws = Workspace::test_new("test");
+        let closing_tab = ws.test_add_tab(None);
+        let closing_root = ws.tabs[closing_tab].root_pane;
+        let right_tab = ws.test_add_tab(None);
+        let right_root = ws.tabs[right_tab].root_pane;
+        ws.switch_tab(closing_tab);
+
+        assert!(!ws.remove_pane(closing_root));
+
+        assert_eq!(ws.tabs[ws.active_tab].root_pane, right_root);
         ws.assert_invariants_for_test();
     }
 
