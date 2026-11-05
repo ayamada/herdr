@@ -179,6 +179,13 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A pane child reported OSC 9;4 progress. The headless server aggregates
+    /// these across all panes and forwards the result to the foreground
+    /// client's outer terminal.
+    TerminalProgress {
+        pane_id: PaneId,
+        report: crate::ghostty::ProgressReport,
+    },
     /// A pane child reported its shell current directory through terminal
     /// metadata such as OSC 7.
     TerminalCwdReported {

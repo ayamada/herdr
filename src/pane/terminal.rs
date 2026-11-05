@@ -168,6 +168,7 @@ pub(crate) struct ProcessBytesResult {
     pub terminal_title_changed: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
+    pub progress_report: Option<crate::ghostty::ProgressReport>,
     pub reported_cwd: Option<std::path::PathBuf>,
     pub terminal_responses: Vec<Bytes>,
 }
@@ -1366,6 +1367,7 @@ impl GhosttyPaneTerminal {
                 terminal_title_changed: false,
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
+                progress_report: None,
                 reported_cwd: None,
                 terminal_responses: Vec::new(),
             };
@@ -1376,6 +1378,7 @@ impl GhosttyPaneTerminal {
         // Those effects must not be delivered as live pane output.
         let _ = core.terminal.take_bell_count();
         let _ = core.terminal.take_clipboard_writes();
+        let _ = core.terminal.take_progress_report();
         let default_color_observation = core.default_color_tracker.observe(bytes);
         if shell_pid > 0 && default_color_observation {
             if let Some(owner_pgid) = current_transient_default_color_owner(shell_pid) {
@@ -1421,6 +1424,7 @@ impl GhosttyPaneTerminal {
         );
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
+        let progress_report = core.terminal.take_progress_report();
         let reported_cwd = core
             .terminal
             .take_pwd_changes()
@@ -1483,6 +1487,7 @@ impl GhosttyPaneTerminal {
             terminal_title_changed,
             terminal_bells,
             clipboard_writes,
+            progress_report,
             reported_cwd,
             terminal_responses,
         }
@@ -4177,6 +4182,33 @@ mod tests {
         assert_eq!(result.terminal_bells, 2);
         let drained = pane.process_pty_bytes(pane_id, 0, b"live output", &tx);
         assert_eq!(drained.terminal_bells, 0);
+    }
+
+    #[test]
+    fn process_pty_bytes_surfaces_live_progress_only() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.seed_history_ansi("\x1b]9;4;1;42\x07");
+        let result = pane.process_pty_bytes(pane_id, 0, b"live output", &tx);
+        assert_eq!(result.progress_report, None);
+
+        let live = pane.process_pty_bytes(pane_id, 0, b"\x1b]9;4;3\x07", &tx);
+        assert_eq!(
+            live.progress_report,
+            Some(crate::ghostty::ProgressReport {
+                state: crate::ghostty::ProgressState::Indeterminate,
+                progress: None,
+            })
+        );
+
+        let cleared = pane.process_pty_bytes(pane_id, 0, b"\x1b]9;4;0\x07", &tx);
+        assert_eq!(
+            cleared.progress_report,
+            Some(crate::ghostty::ProgressReport::REMOVE)
+        );
     }
 
     #[test]

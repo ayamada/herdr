@@ -150,6 +150,65 @@ impl ColorScheme {
     }
 }
 
+/// Latest progress report a child emitted through `OSC 9;4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
+}
+
+impl ProgressState {
+    /// Numeric state used by `OSC 9;4` on the wire.
+    pub const fn osc_state(self) -> u8 {
+        match self {
+            Self::Remove => 0,
+            Self::Set => 1,
+            Self::Error => 2,
+            Self::Indeterminate => 3,
+            Self::Pause => 4,
+        }
+    }
+
+    fn from_ffi(value: ffi::GhosttyTerminalProgressState) -> Option<Self> {
+        match value {
+            ffi::GhosttyTerminalProgressState_GHOSTTY_TERMINAL_PROGRESS_STATE_REMOVE => {
+                Some(Self::Remove)
+            }
+            ffi::GhosttyTerminalProgressState_GHOSTTY_TERMINAL_PROGRESS_STATE_SET => {
+                Some(Self::Set)
+            }
+            ffi::GhosttyTerminalProgressState_GHOSTTY_TERMINAL_PROGRESS_STATE_ERROR => {
+                Some(Self::Error)
+            }
+            ffi::GhosttyTerminalProgressState_GHOSTTY_TERMINAL_PROGRESS_STATE_INDETERMINATE => {
+                Some(Self::Indeterminate)
+            }
+            ffi::GhosttyTerminalProgressState_GHOSTTY_TERMINAL_PROGRESS_STATE_PAUSE => {
+                Some(Self::Pause)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One `OSC 9;4` report. `progress` is `None` when the child omitted the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    pub progress: Option<u8>,
+}
+
+impl ProgressReport {
+    /// Explicit "clear the indicator" report (`OSC 9;4;0`).
+    pub const REMOVE: Self = Self {
+        state: ProgressState::Remove,
+        progress: None,
+    };
+}
+
 pub const MOD_SHIFT: u16 = ffi::GHOSTTY_MODS_SHIFT as u16;
 pub const MOD_CTRL: u16 = ffi::GHOSTTY_MODS_CTRL as u16;
 pub const MOD_ALT: u16 = ffi::GHOSTTY_MODS_ALT as u16;
@@ -503,6 +562,7 @@ struct TerminalCallbackState {
     bell_count: u16,
     pwd_changes: Vec<Vec<u8>>,
     clipboard_writes: Vec<Vec<u8>>,
+    progress_report: Option<ProgressReport>,
     size_report: ffi::GhosttySizeReportSize,
     color_scheme: Option<ColorScheme>,
 }
@@ -514,6 +574,33 @@ unsafe extern "C" fn bell_trampoline(_terminal: ffi::GhosttyTerminal, userdata: 
     // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
     let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
     state.bell_count = state.bell_count.saturating_add(1);
+}
+
+unsafe extern "C" fn progress_report_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    report: *const ffi::GhosttyTerminalProgressReport,
+) {
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
+    let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
+    // SAFETY: `size` is the leading field of the borrowed live report.
+    if unsafe { (*report).size } < mem::size_of::<ffi::GhosttyTerminalProgressReport>() {
+        return;
+    }
+    // SAFETY: the size check above covers every field read below.
+    let raw = unsafe { &*report };
+    let Some(progress_state) = ProgressState::from_ffi(raw.state) else {
+        return;
+    };
+    state.progress_report = Some(ProgressReport {
+        state: progress_state,
+        progress: u8::try_from(raw.progress)
+            .ok()
+            .filter(|value| *value <= 100),
+    });
 }
 
 unsafe extern "C" fn color_scheme_trampoline(
@@ -940,6 +1027,12 @@ impl Terminal {
             .into_result()?;
             ffi::ghostty_terminal_set(
                 terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT,
+                (progress_report_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PWD_CHANGED,
                 (pwd_changed_trampoline as *const ()).cast(),
             )
@@ -1163,6 +1256,10 @@ impl Terminal {
 
     pub fn take_bell_count(&mut self) -> u16 {
         mem::take(&mut self.callback_state.bell_count)
+    }
+
+    pub fn take_progress_report(&mut self) -> Option<ProgressReport> {
+        self.callback_state.progress_report.take()
     }
 
     pub fn take_pwd_changes(&mut self) -> Vec<Vec<u8>> {
@@ -4666,6 +4763,73 @@ mod tests {
                 assert!(replies.lock().unwrap().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn progress_report_callback_normalizes_states_and_split_writes() {
+        let cases = [
+            (
+                b"\x1b]9;4;1;42\x07".as_slice(),
+                Some(ProgressState::Set),
+                Some(42),
+            ),
+            (
+                b"\x1b]9;4;1;-1\x1b\\".as_slice(),
+                Some(ProgressState::Set),
+                None,
+            ),
+            (
+                b"\x1b]9;4;0\x07".as_slice(),
+                Some(ProgressState::Remove),
+                None,
+            ),
+            (
+                b"\x1b]9;4;2;7\x07".as_slice(),
+                Some(ProgressState::Error),
+                Some(7),
+            ),
+            (
+                b"\x1b]9;4;3\x07".as_slice(),
+                Some(ProgressState::Indeterminate),
+                None,
+            ),
+            (
+                b"\x1b]9;4;4;75\x07".as_slice(),
+                Some(ProgressState::Pause),
+                Some(75),
+            ),
+            (b"\x1b]9;hello\x07".as_slice(), None, None),
+            (b"\x1b]9;4;9;10\x07".as_slice(), None, None),
+        ];
+        for (bytes, expected_state, expected_progress) in cases {
+            for split in 0..=bytes.len() {
+                let mut terminal = Terminal::new(10, 3, 0).unwrap();
+                terminal.write(&bytes[..split]);
+                if split < bytes.len() {
+                    terminal.write(&bytes[split..]);
+                }
+                let report = terminal.take_progress_report();
+                assert_eq!(
+                    report.map(|report| (report.state, report.progress)),
+                    expected_state.map(|state| (state, expected_progress)),
+                    "bytes {bytes:?} split {split}"
+                );
+                assert_eq!(terminal.take_progress_report(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn progress_report_keeps_only_the_latest_value_per_write() {
+        let mut terminal = Terminal::new(10, 3, 0).unwrap();
+        terminal.write(b"\x1b]9;4;1;10\x07\x1b]9;4;1;90\x07");
+        assert_eq!(
+            terminal.take_progress_report(),
+            Some(ProgressReport {
+                state: ProgressState::Set,
+                progress: Some(90),
+            })
+        );
     }
 
     #[test]

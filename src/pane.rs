@@ -2206,6 +2206,24 @@ fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<App
     }
 }
 
+fn publish_terminal_progress(
+    pane_id: PaneId,
+    report: Option<crate::ghostty::ProgressReport>,
+    events: &mpsc::Sender<AppEvent>,
+) {
+    let Some(report) = report else {
+        return;
+    };
+    if let Err(err) = events.try_send(AppEvent::TerminalProgress { pane_id, report }) {
+        warn!(
+            pane = pane_id.raw(),
+            state = report.state.osc_state(),
+            err = %err,
+            "failed to queue terminal progress"
+        );
+    }
+}
+
 fn publish_reported_cwd(
     pane_id: PaneId,
     cwd: std::path::PathBuf,
@@ -2591,6 +2609,7 @@ impl PaneRuntime {
                 drop(_content_write_guard);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
+                publish_terminal_progress(pane_id, result.progress_report, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
@@ -2794,6 +2813,7 @@ impl PaneRuntime {
                 drop(_content_write_guard);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
+                publish_terminal_progress(pane_id, result.progress_report, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
                 }
