@@ -10,6 +10,7 @@ pub(crate) enum EndpointControlMessage {
     HealthPong,
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
+    OuterProgress(crate::protocol::endpoint::EndpointOuterProgress),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
     Ignored,
 }
@@ -52,6 +53,17 @@ pub(crate) fn decode_endpoint_control(
                 view,
             },
         ));
+    }
+    if kind == crate::protocol::endpoint::OUTER_PROGRESS_KIND {
+        let Ok(progress) =
+            serde_json::from_str::<crate::protocol::endpoint::EndpointOuterProgress>(data)
+        else {
+            return Ok(EndpointControlMessage::Ignored);
+        };
+        return Ok(match progress.validate() {
+            Some(progress) => EndpointControlMessage::OuterProgress(progress),
+            None => EndpointControlMessage::Ignored,
+        });
     }
     if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
         let snapshot = serde_json::from_str(data)
@@ -105,6 +117,42 @@ mod tests {
             decode_endpoint_control(&kind, "invalid").unwrap(),
             EndpointControlMessage::Ignored
         ));
+    }
+
+    #[test]
+    fn outer_progress_decodes_and_rejects_out_of_range_values() {
+        let decoded = decode_endpoint_control(
+            crate::protocol::endpoint::OUTER_PROGRESS_KIND,
+            r#"{"state":1,"progress":42}"#,
+        )
+        .unwrap();
+        let EndpointControlMessage::OuterProgress(decoded) = decoded else {
+            panic!("decoded outer progress");
+        };
+        assert_eq!(decoded.state, 1);
+        assert_eq!(decoded.progress, Some(42));
+
+        let decoded = decode_endpoint_control(
+            crate::protocol::endpoint::OUTER_PROGRESS_KIND,
+            r#"{"state":3}"#,
+        )
+        .unwrap();
+        let EndpointControlMessage::OuterProgress(decoded) = decoded else {
+            panic!("decoded outer progress without a value");
+        };
+        assert_eq!(decoded.progress, None);
+
+        for payload in [
+            r#"{"state":9,"progress":10}"#,
+            r#"{"state":1,"progress":101}"#,
+            "not json",
+        ] {
+            assert!(matches!(
+                decode_endpoint_control(crate::protocol::endpoint::OUTER_PROGRESS_KIND, payload)
+                    .unwrap(),
+                EndpointControlMessage::Ignored
+            ));
+        }
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub(crate) fn is_presentation_effect(message: &ServerMessage) -> bool {
             | ServerMessage::GraphicsFile { .. }
             | ServerMessage::GraphicsTransmissionRetired { .. }
             | ServerMessage::TerminalBell { .. }
+    ) || matches!(
+        message,
+        ServerMessage::EndpointControl { kind, .. }
+            if kind == crate::protocol::endpoint::OUTER_PROGRESS_KIND
     )
 }
 
@@ -95,6 +99,10 @@ mod tests {
         assert!(!is_presentation_effect(&ServerMessage::EndpointControl {
             kind: "shell.snapshot.v1".into(),
             data: "{}".into(),
+        }));
+        assert!(is_presentation_effect(&ServerMessage::EndpointControl {
+            kind: crate::protocol::endpoint::OUTER_PROGRESS_KIND.into(),
+            data: "{\"state\":0}".into(),
         }));
     }
 

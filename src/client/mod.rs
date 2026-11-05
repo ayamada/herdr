@@ -2136,6 +2136,18 @@ async fn run_client_loop(
                                 }
                                 continue;
                             }
+                            Ok(endpoint::EndpointControlMessage::OuterProgress(report)) => {
+                                if endpoint_active && !state.presentation_frozen {
+                                    if let Err(err) = crate::terminal_effects::write_outer_progress(
+                                        &mut io::stdout(),
+                                        report,
+                                        std::env::var_os("TMUX").is_some(),
+                                    ) {
+                                        warn!(err = %err, "failed to emit outer progress");
+                                    }
+                                }
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::Ignored) => {
                                 debug!(%kind, "ignoring unknown endpoint control message");
                                 continue;

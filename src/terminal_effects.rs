@@ -22,6 +22,34 @@ pub(crate) fn write_window_title<W: Write>(writer: &mut W, title: Option<&str>) 
     writer.flush()
 }
 
+/// Writes the aggregated pane progress as `OSC 9;4` for the outer terminal.
+///
+/// A determinate state without a value would read as 0% to the outer terminal,
+/// so it is reported as indeterminate instead. tmux does not pass the sequence
+/// through untranslated, so it is wrapped in the DCS passthrough there.
+pub(crate) fn write_outer_progress<W: Write>(
+    writer: &mut W,
+    report: crate::protocol::endpoint::EndpointOuterProgress,
+    tmux: bool,
+) -> io::Result<()> {
+    let Some(report) = report.validate() else {
+        return Ok(());
+    };
+    let (state, progress) = match (report.state, report.progress) {
+        (1, None) => (3, None),
+        (state, progress) => (state, progress),
+    };
+    let mut sequence = match progress {
+        Some(progress) => format!("\x1b]9;4;{state};{progress}\x1b\\").into_bytes(),
+        None => format!("\x1b]9;4;{state}\x1b\\").into_bytes(),
+    };
+    if tmux {
+        sequence = crate::terminal_notify::wrap_tmux_passthrough(&sequence);
+    }
+    writer.write_all(&sequence)?;
+    writer.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +72,53 @@ mod tests {
         output.clear();
         write_window_title(&mut output, None).unwrap();
         assert_eq!(output, b"\x1b]0;herdr\x07");
+    }
+
+    fn progress(
+        state: u8,
+        progress: Option<u8>,
+    ) -> crate::protocol::endpoint::EndpointOuterProgress {
+        crate::protocol::endpoint::EndpointOuterProgress { state, progress }
+    }
+
+    #[test]
+    fn outer_progress_writes_exact_osc_9_4_sequences() {
+        let cases = [
+            (progress(0, None), b"\x1b]9;4;0\x1b\\".as_slice()),
+            (progress(1, Some(42)), b"\x1b]9;4;1;42\x1b\\".as_slice()),
+            (progress(2, Some(7)), b"\x1b]9;4;2;7\x1b\\".as_slice()),
+            (progress(2, None), b"\x1b]9;4;2\x1b\\".as_slice()),
+            (progress(3, None), b"\x1b]9;4;3\x1b\\".as_slice()),
+            (progress(4, Some(75)), b"\x1b]9;4;4;75\x1b\\".as_slice()),
+            (progress(4, None), b"\x1b]9;4;4\x1b\\".as_slice()),
+        ];
+        for (report, expected) in cases {
+            let mut output = Vec::new();
+            write_outer_progress(&mut output, report, false).unwrap();
+            assert_eq!(output, expected, "report {report:?}");
+        }
+    }
+
+    #[test]
+    fn determinate_progress_without_a_value_becomes_indeterminate() {
+        let mut output = Vec::new();
+        write_outer_progress(&mut output, progress(1, None), false).unwrap();
+        assert_eq!(output, b"\x1b]9;4;3\x1b\\");
+    }
+
+    #[test]
+    fn invalid_outer_progress_is_not_written() {
+        for report in [progress(9, Some(10)), progress(1, Some(101))] {
+            let mut output = Vec::new();
+            write_outer_progress(&mut output, report, false).unwrap();
+            assert!(output.is_empty(), "report {report:?}");
+        }
+    }
+
+    #[test]
+    fn tmux_outer_progress_is_wrapped_and_escapes_nested_escapes() {
+        let mut output = Vec::new();
+        write_outer_progress(&mut output, progress(1, Some(42)), true).unwrap();
+        assert_eq!(output, b"\x1bPtmux;\x1b\x1b]9;4;1;42\x1b\x1b\\\x1b\\");
     }
 }
