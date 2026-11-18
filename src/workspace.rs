@@ -572,8 +572,11 @@ impl Workspace {
             )?
         };
         self.register_new_pane_with_number(tab.root_pane, pane_number);
-        self.tabs.push(tab);
-        Ok((self.tabs.len() - 1, terminal, runtime))
+        // New tabs open to the right of the tab that is currently focused, not at the end
+        // of the tab list. `insert_idx` is the index the caller needs to select afterwards.
+        let insert_idx = self.active_tab + 1;
+        self.tabs.insert(insert_idx, tab);
+        Ok((insert_idx, terminal, runtime))
     }
 
     pub fn close_tab(&mut self, idx: usize) -> bool {

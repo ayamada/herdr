@@ -479,4 +479,51 @@ mod tests {
         );
         shutdown_test_runtimes(&mut app);
     }
+
+    #[tokio::test]
+    async fn tab_create_inserts_right_of_active_tab() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub,
+        );
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        let mut workspace = Workspace::test_new("tabs");
+        let active = workspace.test_add_tab(Some("active"));
+        let right = workspace.test_add_tab(Some("right"));
+        let right_root = workspace.tabs[right].root_pane;
+        workspace.switch_tab(active);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+
+        let response = app.handle_tab_create(
+            "req".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: true,
+                label: Some("created".into()),
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::TabCreated { tab, .. } = success.result else {
+            panic!("expected tab_created response");
+        };
+        let workspace = &app.state.workspaces[0];
+        assert_eq!(workspace.tabs.len(), 4);
+        assert_eq!(workspace.tabs[active + 1].number, tab.number);
+        assert_eq!(workspace.tabs[right + 1].root_pane, right_root);
+        assert_eq!(workspace.active_tab_index(), active + 1);
+        assert!(tab.focused);
+        shutdown_test_runtimes(&mut app);
+    }
 }
